@@ -14,6 +14,7 @@ import json
 import logging
 import platform
 import socket
+import ssl
 import sys
 import time
 from typing import Optional
@@ -126,9 +127,13 @@ async def run_agent(server: str, agent_id: str, subnet: str):
     scanners: list = []
     last_discovery = 0.0
 
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
     while True:
         try:
-            async with websockets.connect(ws_url, ping_interval=None) as ws:
+            async with websockets.connect(ws_url, ping_interval=None, ssl=ssl_ctx if ws_url.startswith("wss://") else None) as ws:
                 log.info("Connected to Othos cloud ✓")
 
                 async def send_heartbeat():
