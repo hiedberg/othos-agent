@@ -55,7 +55,7 @@ async def probe_escl(ip: str, port: int, timeout: float = 2.0) -> Optional[dict]
     for path in ESCL_PATHS:
         url = f"http://{ip}:{port}{path}"
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 response = await client.get(url)
             if response.status_code == 200:
                 scanner = {"ip": ip, "port": port, "protocol": "eSCL"}
