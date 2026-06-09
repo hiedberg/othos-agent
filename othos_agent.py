@@ -12,6 +12,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import platform
 import socket
 import ssl
@@ -103,7 +104,7 @@ async def discover_scanners(subnet: str) -> list:
     return found
 
 
-async def pair_agent(server: str, code: str) -> dict:
+async def pair_agent(server: str, code: str, insecure: bool = False, ca_bundle: Optional[str] = None) -> dict:
     url = f"{server}/api/v1/scanners/agent/pair"
     payload = {
         "code": code,
@@ -111,29 +112,43 @@ async def pair_agent(server: str, code: str) -> dict:
         "version": VERSION,
         "platform": f"{platform.system()} {platform.release()}",
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    client_kwargs = {"timeout": 15.0}
+    if insecure:
+        client_kwargs["verify"] = False
+    elif ca_bundle:
+        client_kwargs["verify"] = ca_bundle
+    async with httpx.AsyncClient(**client_kwargs) as client:
         response = await client.post(url, json=payload)
     if response.status_code != 200:
         raise RuntimeError(f"Pairing failed: {response.status_code} {response.text}")
     return response.json()
 
 
-async def run_agent(server: str, agent_id: str, subnet: str):
+def get_ssl_context(insecure: bool = False, ca_bundle: Optional[str] = None) -> Optional[ssl.SSLContext]:
+    if insecure:
+        log.warning("SSL verification disabled — insecure mode (development only)")
+        return ssl._create_unverified_context()
+    if ca_bundle:
+        log.info(f"Using custom CA bundle: {ca_bundle}")
+        context = ssl.create_default_context(cafile=ca_bundle)
+        return context
+    return None
+
+
+async def run_agent(server: str, agent_id: str, subnet: str, insecure: bool = False, ca_bundle: Optional[str] = None):
     ws_url = server.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = f"{ws_url}/api/v1/scanners/agent/ws/{agent_id}"
 
     log.info(f"Connecting to {ws_url}")
 
+    ssl_context = get_ssl_context(insecure, ca_bundle)
+
     scanners: list = []
     last_discovery = 0.0
 
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
     while True:
         try:
-            async with websockets.connect(ws_url, ping_interval=None, ssl=ssl_ctx if ws_url.startswith("wss://") else None) as ws:
+            async with websockets.connect(ws_url, ping_interval=None, ssl=ssl_context) as ws:
                 log.info("Connected to Othos cloud ✓")
 
                 async def send_heartbeat():
@@ -187,6 +202,8 @@ async def main():
     parser.add_argument("--code", required=True, help="Pairing code from Othos settings")
     parser.add_argument("--server", default="https://api.othos.com", help="Othos server URL")
     parser.add_argument("--subnet", help="Subnet to scan (e.g. 192.168.1.0/24). Auto-detected if omitted.")
+    parser.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification (development/ngrok only)")
+    parser.add_argument("--ca-bundle", dest="ca_bundle", help="Path to custom CA certificate bundle (for on-prem/internal CA)")
     args = parser.parse_args()
 
     print(f"""
@@ -206,7 +223,7 @@ async def main():
     log.info("Pairing with Othos...")
 
     try:
-        pair_data = await pair_agent(args.server, args.code)
+        pair_data = await pair_agent(args.server, args.code, insecure=args.insecure, ca_bundle=args.ca_bundle)
     except RuntimeError as e:
         log.error(str(e))
         sys.exit(1)
@@ -215,7 +232,7 @@ async def main():
     log.info(f"Paired successfully — Agent ID: {agent_id}")
     log.info("Starting scanner discovery and tunnel...")
 
-    await run_agent(args.server, agent_id, subnet)
+    await run_agent(args.server, agent_id, subnet, insecure=args.insecure, ca_bundle=args.ca_bundle)
 
 
 if __name__ == "__main__":
