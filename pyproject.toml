@@ -12,6 +12,11 @@ dependencies = [
     "websockets>=12.0",
 ]
 
+[project.optional-dependencies]
+sane = ["python-sane>=2.9.1"]
+wia = ["pywin32>=306"]
+all = ["python-sane>=2.9.1", "pywin32>=306"]
+
 [project.scripts]
 othos-agent = "othos_agent.cli:run"
 

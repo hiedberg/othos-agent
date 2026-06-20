@@ -7,8 +7,9 @@ import httpx
 import websockets
 
 from .config import DISCOVERY_INTERVAL, HEARTBEAT_INTERVAL, RECONNECT_DELAY, VERSION, log
-from .discovery import discover_scanners, probe_direct_scanners
+from .discovery import available_strategies, discover_all, discover_direct
 from .pairing import get_ssl_context
+from .protocols import available_protocols
 from .scanner import execute_scan
 
 
@@ -27,6 +28,8 @@ async def run_agent(
     ws_url = f"{ws_url}/api/v1/scanners/agent/ws/{agent_id}"
 
     log.info(f"Connecting to {ws_url}")
+    log.info(f"Available scan protocols: {available_protocols()}")
+    log.info(f"Available discovery strategies: {available_strategies()}")
 
     ssl_context = get_ssl_context(insecure, ca_bundle)
 
@@ -107,9 +110,9 @@ async def _discovery_loop(ws, subnet, local_ip, hints, scanners_direct, scanners
         if now - last_discovery > DISCOVERY_INTERVAL:
             last_discovery = now
             if scanners_direct:
-                found = await probe_direct_scanners(scanners_direct, local_ip=local_ip)
+                found = await discover_direct(scanners_direct, local_ip=local_ip)
             else:
-                found = await discover_scanners(subnet, hints=hints)
+                found = await discover_all(subnet, hints=hints)
             scanners[:] = found
             if found:
                 log.info(f"Reporting {len(found)} scanner(s) to cloud")

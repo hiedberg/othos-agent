@@ -10,7 +10,7 @@ Othos supports three scanner protocols:
 | **SANE** | USB | Direct cable | Linux USB scanners |
 | **WIA** | USB | Direct cable | Windows USB scanners |
 
-**eSCL scanners** work with the **Othos Scanner Agent** — a lightweight Python script that runs on any device connected to the same network as your scanner (Mac, Windows, Linux, Raspberry Pi) and creates a secure WebSocket tunnel to the Othos backend.
+**eSCL scanners** work with the **Othos Scanner Agent** — a pip-installable Python package that runs on any device connected to the same network as your scanner (Mac, Windows, Linux, Raspberry Pi) and creates a secure WebSocket tunnel to the Othos backend.
 
 **USB scanners (SANE/WIA)** require the backend to run on the same machine as the scanner (on-prem only) or use a local network setup with Tailscale VPN.
 
@@ -60,41 +60,42 @@ The same agent-based workflow is used for local development and production.
 
 ### Step 1 — Install the Agent
 
-From the machine that can reach your scanner (your Mac for local dev):
+From the machine that can reach your scanner:
 
 ```bash
-# Install dependencies
-pip3 install httpx websockets
-
-# Download the agent
-curl -O https://raw.githubusercontent.com/hiedberg/othos-agent/main/othos_agent.py
+pip3 install git+https://github.com/hiedberg/othos-agent.git
 ```
 
-Or use the local copy:
+### Step 2 — Find your printer IP (optional but recommended)
+
+Run this in your terminal to find your printer's IP address:
+
 ```bash
-cd /Users/daudadedokun/Desktop/workstation/Hiedberg-Data-Project/othos/othos-agent
-pip3 install -r requirements.txt
+arp -a | grep -iE "hp|epson|canon|brother|lexmark|xerox|ricoh|kyocera|samsung|konica|sharp|dell|oki|toshiba|zebra"
 ```
 
-### Step 2 — Generate a Pairing Code
+Example output: `hpd85926.lan (192.168.1.253) at a8:b1:3b:d8:59:26`
+
+### Step 3 — Generate a Pairing Code
 
 1. Open the Othos web app → **Settings → Scanners → Connect Agent**
-2. Select your workspace
-3. Click **Generate Pairing Code** — a 10-minute one-time code appears
+2. Enter the printer IP (e.g. `192.168.1.253:8080`) in the Step 2 field
+3. Click **Generate Pairing Code** — a 10-minute one-time code appears and the run command is copied to your clipboard
 
-### Step 3 — Run the Agent
+### Step 4 — Run the Agent
 
 ```bash
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server http://localhost:8000
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000
 ```
 
-**For local development with the Docker backend:**
+**With a known printer IP (skips subnet scan — faster and more reliable):**
 ```bash
-# If backend is running on localhost:8000 (exposed from Docker)
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server http://localhost:8000
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000 --scanner 192.168.1.253:8080
+```
 
-# With ngrok (for testing external access)
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://your-app.ngrok-free.app --insecure
+**With ngrok (for testing external access):**
+```bash
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server https://your-app.ngrok-free.app --insecure
 ```
 
 **SSL Options:**
@@ -104,6 +105,7 @@ python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://your-app.ngrok-fre
 | `--insecure` | Skip SSL verification | Development with ngrok, self-signed certs |
 | `--ca-bundle /path/to/ca.pem` | Use custom CA bundle | On-prem with internal/private CA |
 | `--subnet 192.168.x.0/24` | Force specific subnet | Auto-detection fails |
+| `--scanner IP:PORT` | Skip discovery, use known IP directly | Fastest — bypasses subnet scan |
 
 **Expected output:**
 ```
@@ -117,13 +119,13 @@ python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://your-app.ngrok-fre
 2024-01-15 09:30:16 [INFO] Reported 1 scanner(s) to backend
 ```
 
-### Step 4 — Verify in the UI
+### Step 5 — Verify in the UI
 
 Return to **Settings → Scanners → Connect Agent**:
 - Agent status shows **Connected**
 - Discovered scanners appear under **Registered Scanners**
 
-### Step 5 — Scan
+### Step 6 — Scan
 
 1. Go to **Documents** or **Extraction**
 2. Click **Scan** → Select your scanner
@@ -141,18 +143,21 @@ For **network scanners** (eSCL) in cloud deployments:
 AWS/GCP/Azure Backend
       │  WebSocket (outbound from office)
       ▼
-Office Device running othos_agent.py
+Office Device running othos-agent
       │  LAN HTTP to printer
       ▼
 HP DeskJet / any eSCL printer (192.168.x.x)
 ```
 
 **Setup:**
-1. Install agent on office device: `pip3 install httpx websockets`
+1. Install agent on office device:
+   ```bash
+   pip3 install git+https://github.com/hiedberg/othos-agent.git
+   ```
 2. Generate pairing code in UI (Settings → Scanners → Connect Agent)
 3. Run agent with production server:
    ```bash
-   python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com
+   python3 -m othos_agent --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com --scanner 192.168.1.253:8080
    ```
 
 > **USB scanners (SANE/WIA)** are not supported via the agent. Use Tailscale VPN or on-prem deployment for USB scanners.
@@ -171,7 +176,7 @@ launchctl load ~/Library/LaunchAgents/com.othos.agent.plist
 Description=Othos Scanner Agent
 
 [Service]
-ExecStart=python3 /opt/othos_agent.py --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com
+ExecStart=python3 -m othos_agent --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com --scanner 192.168.1.253:8080
 Restart=always
 
 [Install]
@@ -319,19 +324,25 @@ Scanners auto-register on backend startup. Discovery probes the local network di
 
 ```bash
 # Install
-pip3 install httpx websockets
+pip3 install git+https://github.com/hiedberg/othos-agent.git
 
 # Local development
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server http://localhost:8000
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000
+
+# With known printer IP (faster, skips subnet scan)
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000 --scanner 192.168.1.253:8080
 
 # Production (HTTPS)
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com --scanner 192.168.1.253:8080
 
 # With ngrok / self-signed cert
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://xxx.ngrok-free.app --insecure
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server https://xxx.ngrok-free.app --insecure
 
 # Force specific subnet
-python3 othos_agent.py --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com --subnet 192.168.1.0/24
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server https://othos.yourdomain.com --subnet 192.168.1.0/24
+
+# Uninstall
+pip3 uninstall othos-agent
 ```
 
 ### Backend Logs
