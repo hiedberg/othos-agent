@@ -22,6 +22,7 @@ import tempfile
 import time
 from typing import Optional
 from urllib.parse import urlparse
+import urllib.request
 
 import httpx
 import websockets
@@ -32,6 +33,7 @@ HEARTBEAT_INTERVAL = 30
 DISCOVERY_INTERVAL = 120
 ESCL_PATHS = ["/eSCL/ScannerCapabilities", "/escl/ScannerCapabilities"]
 ESCL_PORTS = [80, 8080, 443]
+HINT_PROBE_TIMEOUT = 5.0
 RECONNECT_DELAY = 5
 SUPPORTED_FORMATS = {"jpeg", "jpg", "pdf", "png", "tiff"}
 
@@ -55,7 +57,7 @@ def get_local_subnet() -> Optional[str]:
         return None
 
 
-async def probe_escl(ip: str, port: int, timeout: float = 2.0) -> Optional[dict]:
+async def probe_escl(ip: str, port: int, timeout: float = 4.0) -> Optional[dict]:
     for path in ESCL_PATHS:
         url = f"http://{ip}:{port}{path}"
         try:
@@ -88,34 +90,60 @@ async def probe_escl(ip: str, port: int, timeout: float = 2.0) -> Optional[dict]
                 pass
             scanner.setdefault("name", f"Scanner {ip}:{port}")
             return scanner
-        except Exception:
+        except httpx.TimeoutException:
+            log.debug(f"Timeout probing {url}")
+            continue
+        except httpx.ConnectError:
+            continue
+        except Exception as e:
+            log.debug(f"Error probing {url}: {e}")
             continue
     return None
 
 
-async def discover_scanners(subnet: str) -> list:
+async def probe_hint(ip: str) -> Optional[dict]:
+    for port in ESCL_PORTS:
+        result = await probe_escl(ip, port, timeout=HINT_PROBE_TIMEOUT)
+        if result:
+            return result
+    return None
+
+
+async def discover_scanners(subnet: str, hints: Optional[list] = None) -> list:
+    found = []
+    seen_ips: set = set()
+
+    if hints:
+        log.info(f"Probing {len(hints)} hint IP(s) first: {', '.join(hints)}")
+        hint_results = await asyncio.gather(*[probe_hint(ip) for ip in hints], return_exceptions=True)
+        for result in hint_results:
+            if isinstance(result, dict):
+                ip = result["ip"]
+                if ip not in seen_ips:
+                    seen_ips.add(ip)
+                    found.append(result)
+                    log.info(f"Found scanner [hint]: {result.get('name', ip)} at {ip}:{result['port']}")
+        if found:
+            log.info(f"Found {len(found)} scanner(s) via hints — skipping subnet scan")
+            return found
+        log.info("No scanners found via hints — falling back to subnet scan")
+
     log.info(f"Scanning subnet {subnet} for eSCL printers...")
     network = ipaddress.IPv4Network(subnet, strict=False)
-    found = []
-    seen = set()
-    sem = asyncio.Semaphore(50)
+    hosts = [str(h) for h in network.hosts()]
+    batch_size = 25
 
-    async def _probe_with_sem(ip: str, port: int):
-        async with sem:
-            return await probe_escl(ip, port)
+    all_results = []
+    for i in range(0, len(hosts), batch_size):
+        batch = hosts[i:i + batch_size]
+        tasks = [probe_escl(ip, port) for ip in batch for port in ESCL_PORTS]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        all_results.extend(batch_results)
 
-    hosts = list(network.hosts())
-    tasks = []
-    for host in hosts:
-        for port in ESCL_PORTS:
-            tasks.append(_probe_with_sem(str(host), port))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
     candidates = sorted(
-        [r for r in results if isinstance(r, dict)],
+        [r for r in all_results if isinstance(r, dict)],
         key=lambda r: r["port"],
     )
-    seen_ips: set = set()
     for result in candidates:
         ip = result["ip"]
         if ip not in seen_ips:
@@ -158,7 +186,99 @@ def get_ssl_context(insecure: bool = False, ca_bundle: Optional[str] = None) -> 
     return None
 
 
-async def execute_scan(ip: str, port: int, config: dict, protocol: str = "eSCL", scheme: str = "http", ws=None, request_id: str = None) -> dict:
+_IS_WINDOWS = platform.system() == "Windows"
+_ROUTING_ERRORS = ("No route to host", "All connection attempts failed", "Network is unreachable", "ConnectError")
+
+
+def _needs_interface_binding(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(e in msg for e in _ROUTING_ERRORS)
+
+
+def _parse_curl_response(raw: bytes) -> tuple:
+    header_end = raw.find(b"\r\n\r\n")
+    if header_end == -1:
+        header_end = raw.find(b"\n\n")
+        body = raw[header_end + 2:] if header_end != -1 else raw
+    else:
+        body = raw[header_end + 4:]
+    header_text = raw[:header_end].decode("utf-8", errors="replace") if header_end != -1 else ""
+    status = 0
+    for line in header_text.splitlines():
+        if line.startswith("HTTP/"):
+            try:
+                status = int(line.split()[1])
+            except Exception:
+                pass
+            break
+    return status, header_text, body
+
+
+def _curl_get(url: str, local_ip: str = "", timeout: int = 30) -> tuple:
+    import subprocess
+    cmd = ["curl", "-sS", "-D", "-", "--max-time", str(timeout)]
+    if local_ip and not _IS_WINDOWS:
+        cmd += ["--interface", local_ip]
+    cmd.append(url)
+    result = subprocess.run(cmd, capture_output=True, timeout=timeout + 2)
+    if result.returncode != 0:
+        raise Exception(f"curl GET {url} failed (exit {result.returncode}): {result.stderr.decode().strip()}")
+    status, header_text, body = _parse_curl_response(result.stdout)
+    return status, header_text, body
+
+
+def _curl_post(url: str, data: str, content_type: str = "application/xml", local_ip: str = "", timeout: int = 30) -> tuple:
+    import subprocess
+    cmd = ["curl", "-sS", "-D", "-", "--max-time", str(timeout), "-X", "POST",
+           "-H", f"Content-Type: {content_type}", "--data-binary", data]
+    if local_ip and not _IS_WINDOWS:
+        cmd += ["--interface", local_ip]
+    cmd.append(url)
+    result = subprocess.run(cmd, capture_output=True, timeout=timeout + 2)
+    if result.returncode != 0:
+        raise Exception(f"curl POST {url} failed (exit {result.returncode}): {result.stderr.decode().strip()}")
+    status, header_text, body = _parse_curl_response(result.stdout)
+    location = None
+    for line in header_text.splitlines():
+        if line.lower().startswith("location:"):
+            location = line.split(":", 1)[1].strip()
+    return status, location, body
+
+
+def _httpx_get_sync(url: str, timeout: int = 30) -> tuple:
+    response = httpx.get(url, timeout=timeout, follow_redirects=True)
+    return response.status_code, "", response.content
+
+
+def _httpx_post_sync(url: str, data: str, content_type: str = "application/xml", timeout: int = 30) -> tuple:
+    response = httpx.post(url, content=data.encode(),
+                          headers={"Content-Type": content_type},
+                          timeout=timeout, follow_redirects=False)
+    location = response.headers.get("location")
+    return response.status_code, location, response.content
+
+
+def scanner_http_get(url: str, local_ip: str = "", timeout: int = 30) -> tuple:
+    try:
+        return _httpx_get_sync(url, timeout=timeout)
+    except Exception as exc:
+        if not _IS_WINDOWS and _needs_interface_binding(exc):
+            log.debug(f"httpx GET failed ({exc}), retrying via curl --interface {local_ip}")
+            return _curl_get(url, local_ip=local_ip, timeout=timeout)
+        raise
+
+
+def scanner_http_post(url: str, data: str, content_type: str = "application/xml", local_ip: str = "", timeout: int = 30) -> tuple:
+    try:
+        return _httpx_post_sync(url, data, content_type=content_type, timeout=timeout)
+    except Exception as exc:
+        if not _IS_WINDOWS and _needs_interface_binding(exc):
+            log.debug(f"httpx POST failed ({exc}), retrying via curl --interface {local_ip}")
+            return _curl_post(url, data, content_type=content_type, local_ip=local_ip, timeout=timeout)
+        raise
+
+
+async def execute_scan(ip: str, port: int, config: dict, protocol: str = "eSCL", scheme: str = "http", ws=None, request_id: str = None, local_ip: str = "") -> dict:
     base_url = f"{scheme}://{ip}:{port}"
     scan_jobs_url = f"{base_url}/eSCL/ScanJobs"
     scanner_status_url = f"{base_url}/eSCL/ScannerStatus"
@@ -218,142 +338,188 @@ async def execute_scan(ip: str, port: int, config: dict, protocol: str = "eSCL",
     <scan:DocumentFormat>image/{format_type}</scan:DocumentFormat>
 </scan:ScanSettings>'''
 
-    client_kwargs = {"timeout": 30.0, "follow_redirects": False}
-    if scheme == "https":
-        client_kwargs["verify"] = False
+    loop = asyncio.get_event_loop()
+    log.info(f"Creating scan job at {scan_jobs_url}")
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        log.info(f"Creating scan job at {scan_jobs_url}")
+    job_uri = None
+    image_data = None
+    max_job_retries = 12
+    max_wait = 10
 
-        job_uri = None
-        image_data = None
-        max_job_retries = 12
-        max_wait = 10
+    for job_attempt in range(max_job_retries):
+        status, location, _ = await loop.run_in_executor(
+            None, lambda: scanner_http_post(scan_jobs_url, settings_xml, local_ip=local_ip)
+        )
 
-        for job_attempt in range(max_job_retries):
-            response = await client.post(
-                scan_jobs_url,
-                content=settings_xml,
-                headers={"Content-Type": "application/xml"},
+        if status in (200, 201, 202):
+            if location:
+                job_uri = urlparse(location).path if location.startswith("http") else location
+                log.info(f"Job created: {job_uri}")
+            break
+
+        if status == 503:
+            log.info(f"Scanner busy (503), checking for existing job (attempt {job_attempt+1}/{max_job_retries})...")
+            await _send_progress("busy", f"Scanner busy (attempt {job_attempt+1}/{max_job_retries})...")
+
+            s_status, _, s_body = await loop.run_in_executor(
+                None, lambda: scanner_http_get(scanner_status_url, local_ip=local_ip)
             )
-
-            if response.status_code in (200, 201, 202):
-                location = response.headers.get("Location")
-                if location:
-                    if location.startswith("http://") or location.startswith("https://"):
-                        job_uri = urlparse(location).path
-                    else:
-                        job_uri = location
-                    log.info(f"Job created: {job_uri}")
-                break
-
-            if response.status_code == 503:
-                log.info(f"Scanner busy (503), checking for existing job (attempt {job_attempt+1}/{max_job_retries})...")
-                await _send_progress("busy", f"Scanner busy (attempt {job_attempt+1}/{max_job_retries})...")
-
-                status_resp = await client.get(scanner_status_url)
-                if status_resp.status_code == 200:
-                    try:
-                        root = ET.fromstring(status_resp.text)
-                        existing_job = None
-                        scanner_state = None
-
-                        for elem in root.iter():
-                            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-                            if tag == "ScannerState":
-                                scanner_state = elem.text
-                            elif tag == "JobUri":
-                                existing_job = {"uri": elem.text}
-                            elif tag == "JobState" and existing_job:
-                                existing_job["state"] = elem.text
-
-                        log.info(f"ScannerState: {scanner_state}, existing_job: {existing_job}")
-
-                        if existing_job and existing_job.get("state") in ("Processing", "Pending"):
-                            job_uri = existing_job["uri"]
-                            if job_uri and (job_uri.startswith("http://") or job_uri.startswith("https://")):
-                                job_uri = urlparse(job_uri).path
-                            log.info(f"Found existing job after 503: {job_uri}")
-                            await _send_progress("scanning", "Resuming existing scan job...")
-                            break
-
-                        if scanner_state and scanner_state.lower() in ("idle", "processing"):
-                            log.info(f"Scanner state is {scanner_state} — 503 may be transient, retrying...")
-                    except Exception:
-                        pass
-
-                if job_attempt < max_job_retries - 1:
-                    wait_time = min(3 + job_attempt * 2, max_wait)
-                    log.info(f"Scanner busy, waiting {wait_time}s before retry ({job_attempt+1}/{max_job_retries})...")
-                    await _send_progress("retrying", f"Scanner busy — retrying in {wait_time}s ({job_attempt+1}/{max_job_retries})...")
-                    await asyncio.sleep(wait_time)
-            else:
-                raise Exception(f"Failed to create scan job: HTTP {response.status_code}")
-
-        if not job_uri:
-            raise Exception("Scanner is busy and no existing job found. Please wait and try again.")
-
-        for attempt in range(120):
-            await asyncio.sleep(1)
-
-            status_resp = await client.get(scanner_status_url)
-            if status_resp.status_code == 200:
+            s_body = s_body if isinstance(s_body, bytes) else s_body.encode()
+            if s_status == 200:
                 try:
-                    root = ET.fromstring(status_resp.text)
-                    job_info = {}
-
+                    root = ET.fromstring(s_body.decode("utf-8", errors="replace"))
+                    existing_job = None
+                    scanner_state = None
                     for elem in root.iter():
                         tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-                        if tag == "JobUri":
-                            job_info["uri"] = elem.text
-                        elif tag == "JobState":
-                            job_info["state"] = elem.text
-                        elif tag == "ImagesCompleted":
-                            job_info["completed"] = int(elem.text) if elem.text else 0
-                        elif tag == "ImagesToTransfer":
-                            job_info["to_transfer"] = int(elem.text) if elem.text else 0
+                        if tag == "ScannerState":
+                            scanner_state = elem.text
+                        elif tag == "JobUri":
+                            existing_job = {"uri": elem.text}
+                        elif tag == "JobState" and existing_job:
+                            existing_job["state"] = elem.text
+                    if existing_job and existing_job.get("state") in ("Processing", "Pending"):
+                        job_uri = existing_job["uri"]
+                        if job_uri and job_uri.startswith("http"):
+                            job_uri = urlparse(job_uri).path
+                        log.info(f"Found existing job after 503: {job_uri}")
+                        await _send_progress("scanning", "Resuming existing scan job...")
+                        break
+                except Exception:
+                    pass
 
-                    if job_info.get("uri") == job_uri:
-                        completed = job_info.get("completed", 0)
-                        to_transfer = job_info.get("to_transfer", 0)
-                        state = job_info.get("state", "Unknown")
-                        log.info(f"Poll {attempt+1}: Job {job_uri} state={state} - {completed}/{to_transfer} images")
+            if job_attempt < max_job_retries - 1:
+                wait_time = min(3 + job_attempt * 2, max_wait)
+                log.info(f"Scanner busy, waiting {wait_time}s before retry ({job_attempt+1}/{max_job_retries})...")
+                await _send_progress("retrying", f"Scanner busy — retrying in {wait_time}s ({job_attempt+1}/{max_job_retries})...")
+                await asyncio.sleep(wait_time)
+        else:
+            raise Exception(f"Failed to create scan job: HTTP {status}")
 
-                        if state in ("Completed", "Processing") and to_transfer > 0 and not image_data:
-                            dl_url = f"{base_url}{job_uri}/NextDocument"
-                            dl_resp = await client.get(dl_url)
-                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
-                                image_data = dl_resp.content
-                                log.info(f"Image downloaded: {len(image_data)} bytes")
-                                break
+    if not job_uri:
+        raise Exception("Scanner is busy and no existing job found. Please wait and try again.")
 
-                        if state == "Completed" and image_data:
+    for attempt in range(120):
+        await asyncio.sleep(1)
+
+        s_status, _, s_body = await loop.run_in_executor(
+            None, lambda: scanner_http_get(scanner_status_url, local_ip=local_ip)
+        )
+        s_body = s_body if isinstance(s_body, bytes) else s_body.encode()
+        if s_status == 200:
+            try:
+                root = ET.fromstring(s_body.decode("utf-8", errors="replace"))
+                job_info = {}
+                for elem in root.iter():
+                    tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+                    if tag == "JobUri":
+                        job_info["uri"] = elem.text
+                    elif tag == "JobState":
+                        job_info["state"] = elem.text
+                    elif tag == "ImagesCompleted":
+                        job_info["completed"] = int(elem.text) if elem.text else 0
+                    elif tag == "ImagesToTransfer":
+                        job_info["to_transfer"] = int(elem.text) if elem.text else 0
+
+                if job_info.get("uri") == job_uri:
+                    state = job_info.get("state", "Unknown")
+                    completed = job_info.get("completed", 0)
+                    to_transfer = job_info.get("to_transfer", 0)
+                    log.info(f"Poll {attempt+1}: Job {job_uri} state={state} - {completed}/{to_transfer} images")
+
+                    if state in ("Completed", "Processing") and to_transfer > 0 and not image_data:
+                        dl_url = f"{base_url}{job_uri}/NextDocument"
+                        _, _, dl_body = await loop.run_in_executor(
+                            None, lambda: scanner_http_get(dl_url, local_ip=local_ip, timeout=60)
+                        )
+                        if len(dl_body) > 1000:
+                            image_data = dl_body
+                            log.info(f"Image downloaded: {len(image_data)} bytes")
                             break
 
-                except Exception as e:
-                    log.debug(f"Error parsing status: {e}")
+                    if state == "Completed" and image_data:
+                        break
 
-            if not image_data and attempt % 3 == 0:
-                dl_url = f"{base_url}{job_uri}/NextDocument"
-                dl_resp = await client.get(dl_url)
-                if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
-                    image_data = dl_resp.content
+            except Exception as e:
+                log.debug(f"Error parsing status: {e}")
+
+        if not image_data and attempt % 3 == 0:
+            dl_url = f"{base_url}{job_uri}/NextDocument"
+            try:
+                _, _, dl_body = await loop.run_in_executor(
+                    None, lambda: scanner_http_get(dl_url, local_ip=local_ip, timeout=60)
+                )
+                if len(dl_body) > 1000:
+                    image_data = dl_body
                     log.info(f"Image downloaded: {len(image_data)} bytes")
                     break
+            except Exception:
+                pass
 
-        if not image_data:
-            raise Exception("Scan did not complete or no image available")
+    if not image_data:
+        raise Exception("Scan did not complete or no image available")
 
-        ext = ".pdf" if format_type == "pdf" else ".jpg"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-            f.write(image_data)
-            temp_path = f.name
+    ext = ".pdf" if format_type == "pdf" else ".jpg"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+        f.write(image_data)
+        temp_path = f.name
 
-        log.info(f"Scan saved to {temp_path} ({len(image_data)} bytes)")
-        return {"file_path": temp_path, "file_size": len(image_data), "format": format_type}
+    log.info(f"Scan saved to {temp_path} ({len(image_data)} bytes)")
+    return {"file_path": temp_path, "file_size": len(image_data), "format": format_type}
 
 
-async def run_agent(server: str, agent_id: str, subnet: str, insecure: bool = False, ca_bundle: Optional[str] = None):
+async def probe_direct_scanners(scanner_specs: list, local_ip: str = "") -> list:
+    found = []
+    for spec in scanner_specs:
+        if ":" in spec:
+            ip, port_str = spec.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                log.warning(f"Invalid scanner spec '{spec}' — expected IP:PORT")
+                continue
+        else:
+            ip = spec
+            port = 8080
+
+        url = f"http://{ip}:{port}/eSCL/ScannerCapabilities"
+        log.info(f"Probing direct scanner at {url}")
+
+        try:
+            status, _, body = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: scanner_http_get(url, local_ip=local_ip, timeout=10)
+            )
+            content = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+            log.info(f"Direct probe {url} → HTTP {status} body_len={len(content)}")
+            if status == 200 and content and "ScannerCapabilities" in content:
+                log.info(f"Direct probe {url} → HTTP 200 OK")
+                scanner = {"ip": ip, "port": port, "protocol": "eSCL", "scheme": "http"}
+                try:
+                    root = ET.fromstring(content)
+                    ns = {
+                        "pwg": "http://www.pwg.org/schemas/2010/12/sm",
+                        "scan": "http://schemas.hp.com/imaging/escl/2011/05/03",
+                    }
+                    make_model = root.find(".//pwg:MakeAndModel", ns)
+                    manufacturer = root.find(".//scan:Manufacturer", ns)
+                    if make_model is not None:
+                        scanner["name"] = make_model.text
+                        scanner["model"] = make_model.text
+                    if manufacturer is not None:
+                        scanner["manufacturer"] = manufacturer.text
+                except Exception:
+                    pass
+                scanner.setdefault("name", f"Scanner {ip}:{port}")
+                found.append(scanner)
+                log.info(f"Direct scanner confirmed: {scanner.get('name')} at {ip}:{port}")
+            else:
+                log.warning(f"Direct scanner {ip}:{port} did not return valid eSCL data — will retry next cycle")
+        except Exception as e:
+            log.warning(f"Direct scanner {ip}:{port} probe failed: {type(e).__name__}: {e}")
+    return found
+
+
+async def run_agent(server: str, agent_id: str, subnet: str, local_ip: str = "", hints: Optional[list] = None, scanners_direct: Optional[list] = None, insecure: bool = False, ca_bundle: Optional[str] = None, token: Optional[str] = None):
     ws_url = server.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = f"{ws_url}/api/v1/scanners/agent/ws/{agent_id}"
 
@@ -367,9 +533,25 @@ async def run_agent(server: str, agent_id: str, subnet: str, insecure: bool = Fa
     active_requests: set = set()
     completed_requests: dict = {}
 
+    # Headers required for WebSocket upgrade through reverse proxies
+    extra_headers = {
+        "User-Agent": f"OthosAgent/{VERSION}",
+        "X-Agent-Version": VERSION,
+    }
+    if token:
+        extra_headers["X-Agent-Token"] = token
+
     while True:
         try:
-            async with websockets.connect(ws_url, ping_interval=None, ssl=ssl_context) as ws:
+            log.info("Establishing WebSocket connection...")
+            async with websockets.connect(
+                ws_url,
+                ping_interval=30,
+                ping_timeout=10,
+                ssl=ssl_context,
+                extra_headers=extra_headers,
+                compression=None,  # Disable compression to avoid issues with some proxies
+            ) as ws:
                 log.info("Connected to Othos cloud ✓")
 
                 async def send_heartbeat():
@@ -386,7 +568,10 @@ async def run_agent(server: str, agent_id: str, subnet: str, insecure: bool = Fa
                         now = time.time()
                         if now - last_discovery > DISCOVERY_INTERVAL:
                             last_discovery = now
-                            scanners = await discover_scanners(subnet)
+                            if scanners_direct:
+                                scanners = await probe_direct_scanners(scanners_direct, local_ip=local_ip)
+                            else:
+                                scanners = await discover_scanners(subnet, hints=hints)
                             if scanners:
                                 log.info(f"Reporting {len(scanners)} scanner(s) to cloud")
                                 await ws.send(json.dumps({
@@ -435,7 +620,7 @@ async def run_agent(server: str, agent_id: str, subnet: str, insecure: bool = Fa
                                     active_requests.add(req_id)
                                     response_payload = {}
                                     try:
-                                        result = await execute_scan(s_ip, s_port, cfg, s_protocol, s_scheme, ws=ws, request_id=req_id)
+                                        result = await execute_scan(s_ip, s_port, cfg, s_protocol, s_scheme, ws=ws, request_id=req_id, local_ip=local_ip)
                                         upload_url = f"{server}/api/v1/scanners/agent/upload"
                                         async with httpx.AsyncClient(timeout=60.0) as upload_client:
                                             with open(result["file_path"], "rb") as f:
@@ -510,6 +695,8 @@ async def main():
     parser.add_argument("--code", required=True, help="Pairing code from Othos settings")
     parser.add_argument("--server", default="https://api.othos.com", help="Othos server URL")
     parser.add_argument("--subnet", help="Subnet to scan (e.g. 192.168.1.0/24). Auto-detected if omitted.")
+    parser.add_argument("--hint", action="append", dest="hints", metavar="IP", help="Known scanner IP(s) to probe first (e.g. 192.168.1.253). Can be repeated.")
+    parser.add_argument("--scanner", action="append", dest="scanners_direct", metavar="IP:PORT", help="Skip discovery entirely — use known scanner IP:PORT directly (e.g. 192.168.1.253:8080). Can be repeated.")
     parser.add_argument("--insecure", action="store_true", help="Disable SSL certificate verification (development/ngrok only)")
     parser.add_argument("--ca-bundle", dest="ca_bundle", help="Path to custom CA certificate bundle (for on-prem/internal CA)")
     args = parser.parse_args()
@@ -526,7 +713,15 @@ async def main():
         log.error("Could not detect local subnet. Provide --subnet manually.")
         sys.exit(1)
 
-    log.info(f"Local subnet: {subnet}")
+    local_ip = str(ipaddress.IPv4Interface(f"{socket.gethostbyname(socket.gethostname())}/24").ip)
+    try:
+        _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _s.connect(("8.8.8.8", 80))
+        local_ip = _s.getsockname()[0]
+        _s.close()
+    except Exception:
+        pass
+    log.info(f"Local subnet: {subnet} (local IP: {local_ip})")
     log.info(f"Server: {args.server}")
     log.info("Pairing with Othos...")
 
@@ -537,10 +732,13 @@ async def main():
         sys.exit(1)
 
     agent_id = pair_data["agent_id"]
+    token = pair_data.get("token")
     log.info(f"Paired successfully — Agent ID: {agent_id}")
     log.info("Starting scanner discovery and tunnel...")
 
-    await run_agent(args.server, agent_id, subnet, insecure=args.insecure, ca_bundle=args.ca_bundle)
+    if args.scanners_direct:
+        log.info(f"Direct scanner mode — skipping subnet scan. Targets: {', '.join(args.scanners_direct)}")
+    await run_agent(args.server, agent_id, subnet, local_ip=local_ip, hints=args.hints, scanners_direct=args.scanners_direct, insecure=args.insecure, ca_bundle=args.ca_bundle, token=token)
 
 
 if __name__ == "__main__":

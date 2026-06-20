@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "othos-agent"
+version = "1.0.0"
+description = "Connects your office printer to the Othos cloud platform"
+requires-python = ">=3.8"
+dependencies = [
+    "httpx>=0.27.0",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+othos-agent = "othos_agent.cli:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/othos_agent"]
