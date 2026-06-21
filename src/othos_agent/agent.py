@@ -31,7 +31,7 @@ async def run_agent(
     log.info(f"Available scan protocols: {available_protocols()}")
     log.info(f"Available discovery strategies: {available_strategies()}")
 
-    ssl_context = get_ssl_context(insecure, ca_bundle)
+    ssl_context = get_ssl_context(insecure, ca_bundle) if ws_url.startswith("wss://") else None
 
     extra_headers = {
         "User-Agent": f"OthosAgent/{VERSION}",
