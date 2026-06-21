@@ -36,6 +36,7 @@ async def run_agent(
     extra_headers = {
         "User-Agent": f"OthosAgent/{VERSION}",
         "X-Agent-Version": VERSION,
+        "ngrok-skip-browser-warning": "true",
     }
     if token:
         extra_headers["X-Agent-Token"] = token

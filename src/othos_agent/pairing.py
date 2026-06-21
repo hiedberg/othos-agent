@@ -3,19 +3,23 @@ import socket
 import ssl
 from typing import Optional
 
+import certifi
 import httpx
 
 from .config import VERSION, log
 
 
-def get_ssl_context(insecure: bool = False, ca_bundle: Optional[str] = None) -> Optional[ssl.SSLContext]:
+def get_ssl_context(insecure: bool = False, ca_bundle: Optional[str] = None) -> ssl.SSLContext:
     if insecure:
         log.warning("SSL verification disabled — insecure mode (development only)")
-        return ssl._create_unverified_context()
-    if ca_bundle:
-        log.info(f"Using custom CA bundle: {ca_bundle}")
-        return ssl.create_default_context(cafile=ca_bundle)
-    return None
+        ctx = ssl._create_unverified_context()
+    else:
+        cafile = ca_bundle or certifi.where()
+        if ca_bundle:
+            log.info(f"Using custom CA bundle: {ca_bundle}")
+        ctx = ssl.create_default_context(cafile=cafile)
+    ctx.set_alpn_protocols(["http/1.1"])
+    return ctx
 
 
 async def pair_agent(server: str, code: str, insecure: bool = False, ca_bundle: Optional[str] = None) -> dict:
