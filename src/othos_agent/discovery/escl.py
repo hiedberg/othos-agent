@@ -30,6 +30,10 @@ def _parse_capabilities(content: str, ip: str, port: int) -> dict:
         if manufacturer is not None:
             scanner["manufacturer"] = manufacturer.text
 
+        version_elem = root.find("pwg:Version", _ESCL_NS)
+        if version_elem is not None and version_elem.text:
+            caps["version"] = version_elem.text
+
         resolutions = []
         for res_elem in root.findall(".//scan:DiscreteResolution", _ESCL_NS):
             x = res_elem.find("scan:XResolution", _ESCL_NS)
@@ -41,15 +45,18 @@ def _parse_capabilities(content: str, ip: str, port: int) -> dict:
         if resolutions:
             caps["resolutions"] = sorted(set(resolutions))
 
-        color_modes = []
+        color_modes_raw = []
+        color_modes_ui = []
         _color_map = {"RGB24": "color", "Grayscale8": "grayscale", "BlackAndWhite1": "bw"}
         for cm_elem in root.findall(".//scan:ColorMode", _ESCL_NS):
-            if cm_elem.text:
+            if cm_elem.text and cm_elem.text not in color_modes_raw:
+                color_modes_raw.append(cm_elem.text)
                 mapped = _color_map.get(cm_elem.text, cm_elem.text.lower())
-                if mapped not in color_modes:
-                    color_modes.append(mapped)
-        if color_modes:
-            caps["color_modes"] = color_modes
+                if mapped not in color_modes_ui:
+                    color_modes_ui.append(mapped)
+        if color_modes_raw:
+            caps["color_modes_raw"] = color_modes_raw
+            caps["color_modes"] = color_modes_ui
 
         paper_sizes = []
         _size_map = {
@@ -58,7 +65,6 @@ def _parse_capabilities(content: str, ip: str, port: int) -> dict:
             "na_legal_8.5x14in": "Legal",
         }
         for region in root.findall(".//pwg:ScanRegion", _ESCL_NS):
-            name_elem = region.find("pwg:ContentRegionUnits", _ESCL_NS)
             discrete = region.find(".//pwg:DiscreteMediaSize", _ESCL_NS)
             if discrete is not None:
                 size_name = discrete.find("pwg:SizeName", _ESCL_NS)
@@ -70,24 +76,63 @@ def _parse_capabilities(content: str, ip: str, port: int) -> dict:
             paper_sizes = ["A4", "Letter", "Legal"]
         caps["paper_sizes"] = paper_sizes
 
-        duplex_elem = root.find(".//scan:AdfDuplexer", _ESCL_NS)
-        caps["duplex"] = duplex_elem is not None
+        platen_caps = root.find(".//scan:PlatenInputCaps", _ESCL_NS)
+        if platen_caps is not None:
+            def _int(elem, tag):
+                e = elem.find(tag, _ESCL_NS)
+                return int(e.text) if e is not None and e.text else None
+            caps["platen"] = {
+                "min_width": _int(platen_caps, "scan:MinWidth"),
+                "max_width": _int(platen_caps, "scan:MaxWidth"),
+                "min_height": _int(platen_caps, "scan:MinHeight"),
+                "max_height": _int(platen_caps, "scan:MaxHeight"),
+            }
+
+        adf_caps = root.find(".//scan:AdfSimplexInputCaps", _ESCL_NS)
+        if adf_caps is not None:
+            def _int_adf(elem, tag):
+                e = elem.find(tag, _ESCL_NS)
+                return int(e.text) if e is not None and e.text else None
+            caps["adf"] = {
+                "min_width": _int_adf(adf_caps, "scan:MinWidth"),
+                "max_width": _int_adf(adf_caps, "scan:MaxWidth"),
+                "min_height": _int_adf(adf_caps, "scan:MinHeight"),
+                "max_height": _int_adf(adf_caps, "scan:MaxHeight"),
+            }
+            duplex_elem = root.find(".//scan:AdfDuplexer", _ESCL_NS)
+            caps["duplex"] = duplex_elem is not None
+        else:
+            caps["adf"] = None
+            caps["duplex"] = False
+
+        intents = []
+        for intent_elem in root.findall(".//scan:Intent", _ESCL_NS):
+            if intent_elem.text and intent_elem.text not in intents:
+                intents.append(intent_elem.text)
+        if intents:
+            caps["intents"] = intents
 
         formats = []
-        for fmt_elem in root.findall(".//scan:DocumentFormat", _ESCL_NS):
+        for fmt_elem in root.findall(".//pwg:DocumentFormat", _ESCL_NS):
             if fmt_elem.text and fmt_elem.text not in formats:
                 formats.append(fmt_elem.text)
         if formats:
             caps["supported_formats"] = formats
 
+        caps["raw_capabilities_xml"] = content
+
     except Exception:
         pass
 
+    caps.setdefault("version", "2.0")
     caps.setdefault("resolutions", [150, 300, 600])
-    caps.setdefault("color_modes", ["color", "grayscale", "bw"])
+    caps.setdefault("color_modes_raw", ["RGB24", "Grayscale8"])
+    caps.setdefault("color_modes", ["color", "grayscale"])
     caps.setdefault("paper_sizes", ["A4", "Letter", "Legal"])
+    caps.setdefault("adf", None)
     caps.setdefault("duplex", False)
     caps.setdefault("supported_formats", ["image/jpeg", "application/pdf"])
+    caps.setdefault("intents", ["Document"])
 
     scanner["capabilities"] = caps
     scanner.setdefault("name", f"Scanner {ip}:{port}")
