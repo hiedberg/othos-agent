@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import sys
+
+import websockets
 
 from .agent import run_agent
 from .config import VERSION, log
@@ -52,6 +56,7 @@ async def _main():
             "Tip: scanner may be on a different interface. "
             "Pass --subnet <network> to scan a specific one."
         )
+    log.info(f"Python {sys.version.split()[0]}  |  websockets {websockets.__version__}")
     log.info(f"Server: {args.server}")
     log.info("Pairing with Othos...")
 
