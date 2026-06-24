@@ -1,21 +1,27 @@
+from __future__ import annotations
+
 from typing import Optional
 
 from ..config import log
 from .base import DiscoveryStrategy
 from .escl import ESCLDiscovery, probe_direct_escl
+from .mdns import MDNSDiscovery
 from .sane import SANEDiscovery
 from .wia import WIADiscovery
 
 _strategies: list[DiscoveryStrategy] = [
+    MDNSDiscovery(),
     ESCLDiscovery(),
     SANEDiscovery(),
     WIADiscovery(),
 ]
 
 
-async def discover_all(subnet: str, hints: Optional[list] = None) -> list[dict]:
+async def discover_all(subnet: str, hints: Optional[list] = None, no_mdns: bool = False) -> list[dict]:
     found = []
     for strategy in _strategies:
+        if no_mdns and isinstance(strategy, MDNSDiscovery):
+            continue
         if not strategy.is_available():
             continue
         try:

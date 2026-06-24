@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import ipaddress
 import xml.etree.ElementTree as ET
@@ -5,7 +7,7 @@ from typing import Optional
 
 import httpx
 
-from ..config import ESCL_PATHS, ESCL_PORTS, HINT_PROBE_TIMEOUT, log
+from ..config import ESCL_PATHS, ESCL_PORTS, HINT_PROBE_TIMEOUT, SUBNET_SCAN_BATCH_SIZE, SUBNET_SCAN_MAX_PREFIX, log
 from ..http_client import scanner_http_get
 from .base import DiscoveryStrategy
 
@@ -177,11 +179,13 @@ class ESCLDiscovery(DiscoveryStrategy):
 
         log.info(f"[eSCL] Scanning subnet {subnet}...")
         network = ipaddress.IPv4Network(subnet, strict=False)
+        if network.prefixlen < SUBNET_SCAN_MAX_PREFIX:
+            network = ipaddress.IPv4Network(f"{network.network_address}/{SUBNET_SCAN_MAX_PREFIX}", strict=False)
+            log.info(f"[eSCL] Subnet capped to /{SUBNET_SCAN_MAX_PREFIX} for scan: {network}")
         hosts = [str(h) for h in network.hosts()]
-        batch_size = 25
         all_results = []
-        for i in range(0, len(hosts), batch_size):
-            batch = hosts[i:i + batch_size]
+        for i in range(0, len(hosts), SUBNET_SCAN_BATCH_SIZE):
+            batch = hosts[i:i + SUBNET_SCAN_BATCH_SIZE]
             tasks = [probe_escl(ip, port) for ip in batch for port in ESCL_PORTS]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             all_results.extend(batch_results)

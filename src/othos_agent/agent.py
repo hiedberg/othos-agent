@@ -23,6 +23,7 @@ async def run_agent(
     insecure: bool = False,
     ca_bundle: Optional[str] = None,
     token: Optional[str] = None,
+    no_mdns: bool = False,
 ):
     ws_url = server.replace("https://", "wss://").replace("http://", "ws://")
     ws_url = f"{ws_url}/api/v1/scanners/agent/ws/{agent_id}"
@@ -53,6 +54,7 @@ async def run_agent(
                 scanners_direct=scanners_direct,
                 ssl_context=ssl_context,
                 extra_headers=extra_headers,
+                no_mdns=no_mdns,
             )
         except Exception as e:
             log.warning(f"Connection lost: {e}. Reconnecting in {RECONNECT_DELAY}s...")
@@ -69,6 +71,7 @@ async def _run_session(
     scanners_direct: Optional[list],
     ssl_context,
     extra_headers: dict,
+    no_mdns: bool = False,
 ):
     scanners: list = []
     last_discovery = 0.0
@@ -89,7 +92,7 @@ async def _run_session(
 
         await asyncio.gather(
             _heartbeat_loop(ws),
-            _discovery_loop(ws, subnet, local_ip, hints, scanners_direct, scanners, lambda s: setattr(_discovery_loop, '_scanners', s)),
+            _discovery_loop(ws, subnet, local_ip, hints, scanners_direct, scanners, lambda s: setattr(_discovery_loop, '_scanners', s), no_mdns=no_mdns),
             _receive_loop(ws, server, agent_id, local_ip, scanner_locks, active_requests, completed_requests),
         )
 
@@ -103,7 +106,7 @@ async def _heartbeat_loop(ws):
             break
 
 
-async def _discovery_loop(ws, subnet, local_ip, hints, scanners_direct, scanners, on_update):
+async def _discovery_loop(ws, subnet, local_ip, hints, scanners_direct, scanners, on_update, no_mdns: bool = False):
     import time
     last_discovery = 0.0
     while True:
@@ -113,7 +116,7 @@ async def _discovery_loop(ws, subnet, local_ip, hints, scanners_direct, scanners
             if scanners_direct:
                 found = await discover_direct(scanners_direct, local_ip=local_ip)
             else:
-                found = await discover_all(subnet, hints=hints)
+                found = await discover_all(subnet, hints=hints, no_mdns=no_mdns)
             scanners[:] = found
             if found:
                 log.info(f"Reporting {len(found)} scanner(s) to cloud")

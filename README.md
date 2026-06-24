@@ -68,13 +68,36 @@ pip3 install git+https://github.com/hiedberg/othos-agent.git
 
 ### Step 2 — Find your printer IP (optional but recommended)
 
-Run this in your terminal to find your printer's IP address:
+> **Skip this step if you have mDNS/Bonjour enabled** (most home/office networks). The agent will discover the scanner automatically via Bonjour without needing its IP.
 
+On **corporate or enterprise networks** (e.g. `10.x.x.x`, `172.x.x.x`) the ARP table shows raw IPs with no hostnames, so scanner brand names won't appear. Use the MAC address OUI prefix instead:
+
+**macOS / Linux:**
 ```bash
-arp -a | grep -iE "hp|epson|canon|brother|lexmark|xerox|ricoh|kyocera|samsung|konica|sharp|dell|oki|toshiba|zebra"
+arp -a | awk '{print $2, $4}' | grep -viE "^(--|ff:ff|01:00|33:33)" | sort
 ```
+Then look up the vendor of each MAC address at **https://macvendors.com** — scanner/printer vendors include `HP Inc`, `Seiko Epson`, `Canon`, `Brother`, `Xerox`.
 
-Example output: `hpd85926.lan (192.168.1.253) at a8:b1:3b:d8:59:26`
+**Windows (PowerShell):**
+```powershell
+arp -a | Select-String -Pattern "dynamic" | ForEach-Object {
+    $parts = $_.ToString().Trim() -split '\s+'
+    [PSCustomObject]@{ IP = $parts[0]; MAC = $parts[1] }
+} | Format-Table -AutoSize
+```
+Look up MAC prefixes at https://macvendors.com.
+
+**Alternatively — if your scanner has a display panel:**
+Go to the printer's **Settings → Network / Wi-Fi → TCP/IP** menu. The IP address is shown directly.
+
+Once you have the IP, pass it to the agent with `--hint` (tries that IP first, then falls back to subnet scan) or `--scanner` (skips scan entirely):
+```bash
+# Try a hinted IP first
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000 --hint 10.112.132.202
+
+# Use exact IP:PORT (fastest, no scan needed)
+python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000 --scanner 10.112.132.202:80
+```
 
 ### Step 3 — Generate a Pairing Code
 
@@ -371,7 +394,9 @@ curl http://192.168.1.253/eSCL/ScannerCapabilities
 | **Agent Connection Issues** |
 | Agent pairing returns 403 CSRF | Old backend version | Backend `/api/v1/scanners/agent/` is CSRF-exempt; upgrade backend if needed |
 | Agent WebSocket disconnects repeatedly | SSL cert verification failure | Use `--insecure` for ngrok/self-signed, or `--ca-bundle` for internal CA |
-| Agent connects but no printers found | No eSCL devices on subnet or wrong subnet detection | Pass `--subnet 192.168.x.0/24` explicitly to the agent |
+| Agent connects but no printers found | No eSCL devices on subnet or wrong subnet detection | Check agent startup log for detected interfaces; pass `--subnet 10.x.0.0/16` for corporate networks |
+| Step 2 `arp -a` shows only IPs, no names | Corporate/enterprise network — no hostname resolution | Use MAC OUI lookup (see Step 2) or check printer display panel for IP |
+| Scanner found on home network but not office/work laptop | Default network interface picks wrong subnet | Agent will list all interfaces at startup; pass `--subnet` matching the interface the scanner is on |
 | **Scanner Discovery Issues** |
 | `No scanners found` in UI | Agent not running or no eSCL scanners on network | Verify agent is connected in UI; check agent logs; ensure scanner supports eSCL |
 | Scanner shows "Offline" | Agent disconnected | Check agent machine is online and WebSocket connection is active |

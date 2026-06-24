@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .base import ScannerProtocol
 from .escl import ESCLProtocol
 from .sane import SANEProtocol
