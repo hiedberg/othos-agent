@@ -82,15 +82,14 @@ async def _run_session(
     completed_requests: dict = {}
 
     ws_version = tuple(int(x) for x in websockets.__version__.split(".")[:2] if x.isdigit())
-    connect_kwargs: dict = {
-        "ping_interval": 30,
-        "ping_timeout": 10,
-        "ssl": ssl_context,
-        "compression": None,
-    }
-    if ws_version >= (10, 0):
+    connect_kwargs: dict = {"ping_interval": 30, "ping_timeout": 10, "ssl": ssl_context}
+    if ws_version >= (14, 0):
+        connect_kwargs["additional_headers"] = extra_headers
+    elif ws_version >= (10, 0):
         connect_kwargs["extra_headers"] = extra_headers
+        connect_kwargs["compression"] = None
     else:
+        connect_kwargs["compression"] = None
         log.warning(f"[WS] websockets {websockets.__version__} is too old — headers not sent. Upgrade: pip3 install 'websockets>=12.0'")
 
     log.info("Establishing WebSocket connection...")
