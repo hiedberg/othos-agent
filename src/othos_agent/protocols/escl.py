@@ -165,6 +165,8 @@ class ESCLProtocol(ScannerProtocol):
         input_color = _COLOR_MODES.get(color_mode, "RGB24")
         input_source = "ADF" if duplex else "Platen"
         doc_format = "application/pdf" if format_type == "pdf" else "image/jpeg"
+        width_px = int(width_mm / 25.4 * resolution)
+        height_px = int(height_mm / 25.4 * resolution)
         xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
     <pwg:Version>2.0</pwg:Version>
@@ -175,9 +177,9 @@ class ESCLProtocol(ScannerProtocol):
     <scan:YResolution>{resolution}</scan:YResolution>
     <pwg:ScanRegions mustHonor="false">
         <pwg:ScanRegion>
-            <pwg:ContentRegionUnits>escl:HundredthsOfMM</pwg:ContentRegionUnits>
-            <pwg:Height>{int(height_mm * 100)}</pwg:Height>
-            <pwg:Width>{int(width_mm * 100)}</pwg:Width>
+            <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+            <pwg:Height>{height_px}</pwg:Height>
+            <pwg:Width>{width_px}</pwg:Width>
             <pwg:XOffset>0</pwg:XOffset>
             <pwg:YOffset>0</pwg:YOffset>
         </pwg:ScanRegion>
