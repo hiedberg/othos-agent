@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import tempfile
@@ -64,7 +66,7 @@ class ESCLProtocol(ScannerProtocol):
         log.info(f"[eSCL] Creating scan job at {scan_jobs_url}")
 
         for job_attempt in range(max_job_retries):
-            status, location, _ = await loop.run_in_executor(
+            status, location, body = await loop.run_in_executor(
                 None, lambda: scanner_http_post(scan_jobs_url, settings_xml, local_ip=local_ip)
             )
             if status in (200, 201, 202):
@@ -72,6 +74,12 @@ class ESCLProtocol(ScannerProtocol):
                     job_uri = urlparse(location).path if location.startswith("http") else location
                     log.info(f"[eSCL] Job created: {job_uri}")
                 break
+            if status == 400 and job_attempt == 0:
+                body_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body or "")
+                log.warning(f"[eSCL] HTTP 400 — scanner rejected settings. Body: {body_text[:500]}")
+                log.info("[eSCL] Retrying with minimal fallback XML...")
+                settings_xml = self._build_minimal_xml(config)
+                continue
             if status == 503:
                 log.info(f"[eSCL] Scanner busy (503), checking existing job (attempt {job_attempt+1}/{max_job_retries})...")
                 await _send_progress("busy", f"Scanner busy (attempt {job_attempt+1}/{max_job_retries})...")
@@ -156,27 +164,44 @@ class ESCLProtocol(ScannerProtocol):
         width_mm, height_mm = _PAPER_SIZES.get(paper_size, (210, 297))
         input_color = _COLOR_MODES.get(color_mode, "RGB24")
         input_source = "ADF" if duplex else "Platen"
+        doc_format = "application/pdf" if format_type == "pdf" else "image/jpeg"
         xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
-    <pwg:Version>2.63</pwg:Version>
+    <pwg:Version>2.0</pwg:Version>
+    <scan:Intent>Document</scan:Intent>
     <scan:InputSource>{input_source}</scan:InputSource>
     <scan:ColorMode>{input_color}</scan:ColorMode>
-    <pwg:ScanRegions>
+    <scan:XResolution>{resolution}</scan:XResolution>
+    <scan:YResolution>{resolution}</scan:YResolution>
+    <pwg:ScanRegions mustHonor="false">
         <pwg:ScanRegion>
-            <pwg:Height>{int(height_mm * 100)}</pwg:Height>
             <pwg:ContentRegionUnits>escl:HundredthsOfMM</pwg:ContentRegionUnits>
+            <pwg:Height>{int(height_mm * 100)}</pwg:Height>
             <pwg:Width>{int(width_mm * 100)}</pwg:Width>
             <pwg:XOffset>0</pwg:XOffset>
             <pwg:YOffset>0</pwg:YOffset>
         </pwg:ScanRegion>
     </pwg:ScanRegions>
-    <scan:Resolution>
-        <scan:Width>{resolution}</scan:Width>
-        <scan:Height>{resolution}</scan:Height>
-    </scan:Resolution>
-    <scan:DocumentFormat>image/{format_type}</scan:DocumentFormat>
+    <scan:DocumentFormat>{doc_format}</scan:DocumentFormat>
+    <scan:DocumentFormatExt>{doc_format}</scan:DocumentFormatExt>
 </scan:ScanSettings>'''
         return xml, format_type
+
+    def _build_minimal_xml(self, config: dict) -> str:
+        resolution = config.get("resolution", 300)
+        color_mode = config.get("color_mode", "color")
+        raw_format = config.get("format", "jpeg").lower()
+        input_color = _COLOR_MODES.get(color_mode, "RGB24")
+        doc_format = "application/pdf" if raw_format == "pdf" else "image/jpeg"
+        return f'''<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+    <pwg:Version>2.0</pwg:Version>
+    <scan:InputSource>Platen</scan:InputSource>
+    <scan:ColorMode>{input_color}</scan:ColorMode>
+    <scan:XResolution>{resolution}</scan:XResolution>
+    <scan:YResolution>{resolution}</scan:YResolution>
+    <scan:DocumentFormat>{doc_format}</scan:DocumentFormat>
+</scan:ScanSettings>'''
 
     def _parse_status(self, body: bytes) -> dict:
         job_info = {}
