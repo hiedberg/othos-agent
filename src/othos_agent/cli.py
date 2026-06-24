@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import subprocess
 import sys
 
 import websockets
@@ -14,7 +15,9 @@ from .pairing import pair_agent
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Othos Scanner Agent")
-    parser.add_argument("--code", required=True, help="Pairing code from Othos settings")
+    parser.add_argument("--version", action="store_true", help="Print version and exit")
+    parser.add_argument("--upgrade", action="store_true", help="Upgrade the agent to the latest version and exit")
+    parser.add_argument("--code", help="Pairing code from Othos settings")
     parser.add_argument("--server", default="https://api.othos.com", help="Othos server URL")
     parser.add_argument("--subnet", help="Subnet to scan (e.g. 192.168.1.0/24). Auto-detected if omitted.")
     parser.add_argument("--hint", action="append", dest="hints", metavar="IP", help="Known scanner IP(s) to probe first. Can be repeated.")
@@ -27,6 +30,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
 async def _main():
     args = _build_parser().parse_args()
+
+    if args.version:
+        print(f"othos-agent {VERSION}")
+        sys.exit(0)
+
+    if args.upgrade:
+        print(f"Upgrading othos-agent from current installation...")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "othos-agent"],
+                check=True,
+            )
+            print("Upgrade complete. Run the agent again to use the new version.")
+        except subprocess.CalledProcessError as e:
+            print(f"Upgrade failed: {e}")
+            sys.exit(1)
+        sys.exit(0)
+
+    if not args.code:
+        _build_parser().error("--code is required unless --version or --upgrade is used")
 
     print(f"""
 ╔══════════════════════════════════════╗
