@@ -343,11 +343,29 @@ Scanners auto-register on backend startup. Discovery probes the local network di
 
 ## Quick Reference
 
+### Install / Uninstall / Upgrade
+
+| Operation | Command | Notes |
+|---|---|---|
+| **Install (production)** | `pip3 install git+https://github.com/hiedberg/othos-agent.git` | From git repo |
+| **Install (local dev)** | `pip3 install -e .` | Editable — picks up live code changes |
+| **Uninstall** | `pip3 uninstall othos-agent` | Standard pip, works on all platforms |
+| **Version check** | `python3 -m othos_agent --version` | Prints `othos-agent 1.0.0` and exits |
+| **Upgrade** | `python3 -m othos_agent --upgrade` | Upgrades via the same Python that installed the agent, then exits |
+
+> `--upgrade` uses `sys.executable` internally — upgrades against the correct pip regardless of PATH. Works identically on macOS, Linux, and Windows.
+
 ### Agent Commands
 
 ```bash
 # Install
 pip3 install git+https://github.com/hiedberg/othos-agent.git
+
+# Check installed version
+python3 -m othos_agent --version
+
+# Upgrade to latest
+python3 -m othos_agent --upgrade
 
 # Local development
 python3 -m othos_agent --code XXXX-XXXX-XXXX --server http://localhost:8000
